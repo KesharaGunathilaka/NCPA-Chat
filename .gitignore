@@ -1,0 +1,10 @@
+.venv/
+
+pycache__/
+*.pyc
+
+pdfs/
+
+data/
+
+.env
