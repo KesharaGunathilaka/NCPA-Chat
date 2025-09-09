@@ -9,10 +9,11 @@ load_dotenv()
 # Groq client
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 groq = Client(api_key=GROQ_API_KEY)
-
-# ChromaDB client (persistent storage)
+# # ChromaDB client (persistent storage)
 client = chromadb.PersistentClient(path="./chroma_db")
 collection = client.get_collection("childprotection_docs")
+# client = chromadb.HttpClient(host="13.60.206.231", port=8000)
+# collection = client.get_collection("childprotection_docs")
 
 # Embedding model
 embed_model = SentenceTransformer("all-mpnet-base-v2")
