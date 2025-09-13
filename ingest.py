@@ -3,26 +3,43 @@ import re
 import json
 import time
 import requests
+import uuid
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-import chromadb
-from chromadb.config import Settings
+import dotenv
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import PointStruct
+
+dotenv.load_dotenv()
 
 BASE = "https://childprotection.gov.lk/"
 OUTPUT_DIR = "data/raw"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 100
+BATCH_SIZE = 100
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Initialize Chroma
-# Persistent client
-client = chromadb.PersistentClient(path="./chroma_db")
+# Qdrant Cloud connection
+qdrant_client = QdrantClient(
+    url=os.getenv("QDRANT_URL"),
+    api_key=os.getenv("QDRANT_API_KEY"),
+    timeout=60.0
+)
 
-# Get or create collection
-collection = client.get_or_create_collection(name="childprotection_docs")
+# print(qdrant_client.get_collections())
+
+COLLECTION_NAME = "childprotection_ncpa"
+
+# Create collection if not exists
+if COLLECTION_NAME not in [c.name for c in qdrant_client.get_collections().collections]:
+    qdrant_client.create_collection(
+        collection_name=COLLECTION_NAME,
+        vectors_config=VectorParams(size=768, distance=Distance.COSINE)
+    )
 
 # Embedding model (multilingual)
 embed_model = SentenceTransformer("all-mpnet-base-v2")  # or "all-MiniLM-L6-v2"
@@ -61,6 +78,14 @@ def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 
+def save_chunks(chunks, source_name, folder="data/chunks"):
+    os.makedirs(folder, exist_ok=True)
+    out_path = os.path.join(folder, f"{source_name}.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False, indent=2)
+    return out_path
+
+
 while to_crawl:
     url = to_crawl.pop(0)
     if url in visited:
@@ -90,16 +115,30 @@ while to_crawl:
                     print("Downloaded PDF:", href)
                     text = extract_text_from_pdf(pdf_path)
                     chunks = chunk_text(text)
+                    save_chunks(chunks, os.path.basename(pdf_path))
                     embeds = embed_model.encode(chunks).tolist()
-                    # upsert into chroma with metadata containing original url and type
+                    # upsert into qdrant with metadata containing original url and type
+                    points = []
                     for i, chunk in enumerate(chunks):
-                        collection.add(
-                            documents=[chunk],
-                            metadatas=[
-                                {"source_url": href, "source_type": "pdf", "pdf_path": pdf_path}],
-                            ids=[f"{os.path.basename(pdf_path)}_{i}"],
-                            embeddings=[embeds[i]]
+                        points.append(
+                            PointStruct(
+                                # unique ID
+                                id=str(uuid.uuid4()),
+                                # id=f"{os.path.basename(pdf_path)}_{i}",
+                                vector=embeds[i],
+                                payload={
+                                    "text": chunk,
+                                    "source_url": href,
+                                    "source_type": "pdf",
+                                    "pdf_path": pdf_path
+                                }
+                            )
                         )
+                    for i in range(0, len(points), BATCH_SIZE):
+                        batch = points[i:i + BATCH_SIZE]
+                        qdrant_client.upsert(
+                            collection_name=COLLECTION_NAME, points=batch)
+                    print(qdrant_client.count(COLLECTION_NAME))
                 except Exception as e:
                     print("pdf error", href, e)
             else:
@@ -111,13 +150,25 @@ while to_crawl:
                          for p in soup.find_all(["p", "h1", "h2", "h3"])])
     if len(main_text) > 50:
         chunks = chunk_text(main_text)
+        save_chunks(chunks, re.sub(r"[^\w\-\.]", "_", urlparse(url).path))
         embeds = embed_model.encode(chunks).tolist()
+        points = []
         for i, chunk in enumerate(chunks):
-            collection.add(
-                documents=[chunk],
-                metadatas=[{"source_url": url, "source_type": "html"}],
-                ids=[f"{urlparse(url).path.replace('/', '_')}_{i}"],
-                embeddings=[embeds[i]]
+            points.append(
+                PointStruct(
+                    id=str(uuid.uuid4()),
+                    # id=f"{urlparse(url).path.replace('/', '_')}_{i}",
+                    vector=embeds[i],
+                    payload={
+                        "text": chunk,
+                        "source_url": url,
+                        "source_type": "html"
+                    }
+                )
             )
+        for i in range(0, len(points), BATCH_SIZE):
+            batch = points[i:i + BATCH_SIZE]
+            qdrant_client.upsert(collection_name=COLLECTION_NAME, points=batch)
+        print(qdrant_client.count(COLLECTION_NAME))
 
-print("Done ingest")
+print("Done Ingest")
